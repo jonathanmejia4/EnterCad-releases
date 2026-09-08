@@ -1,0 +1,329 @@
+# EnterCad — build, sign and publish one release from a `v*` tag.
+#
+# This file is authored and versioned in the PRIVATE source repo at
+# `release/workflows/release.yml` and COPIED into the public releases repo as
+# `.github/workflows/release.yml`. It runs on the public repo's free runners
+# (R-5, mirroring enterjobs-desktop): the private source is cloned with a
+# read-scoped PAT into `src/` under a sparse-checkout that pulls ONLY the files
+# a published artifact is allowed to contain (R-4), the artifacts are signed
+# with Azure Trusted Signing (R-8), and the Release is published back to THIS
+# repo with the built-in GITHUB_TOKEN (same repo -> no extra publish token).
+#
+# Two channels ship from one tag (R-1): the pip WHEEL is primary, the frozen
+# one-dir zip is the fallback. PyPI is the third leg and is allowed to skip
+# with a recorded reason when its token is absent.
+name: Release EnterCad
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub Release for this tag (off = build + upload workflow artifacts only)"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+defaults:
+  run:
+    shell: bash
+jobs:
+  release:
+    name: build, sign, publish
+    runs-on: windows-latest
+    steps:
+      - name: Checkout this (releases) repo
+        uses: actions/checkout@v4
+
+      # R-4/R-5: the sparse-checkout list IS the allowlist. tests/, docs/,
+      # reference/, scripts/, runs/ and cadmcp/acceptance/ never reach the
+      # runner, so they can never reach an artifact. baseline/tools-baseline.json
+      # is read-only input for the manifest tools table when the live stdio
+      # enumeration cannot run; nothing under baseline/ is ever published.
+      - name: Sparse-checkout the private source
+        uses: actions/checkout@v4
+        with:
+          repository: jonathanmejia4/EnterCad
+          token: ${{ secrets.SRC_PAT }}
+          path: src
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            cadmcp/
+            entercad.spec
+            entercad_entry.py
+            pyproject.toml
+            README-INSTALL.md
+            baseline/tools-baseline.json
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the build toolchain
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build setuptools wheel pyinstaller "mcp>=2.1,<3" "pywin32>=306" psutil tomli-w
+
+      # TAG CHECK — fail closed. The version is read with ast.literal_eval of the
+      # `__version__` assignment in src/cadmcp/__init__.py; the package is NEVER
+      # imported here (an import would drag in config/driver resolution just to
+      # read a plain string literal).
+      - name: Tag check (tag minus v must equal cadmcp.__version__)
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import ast
+          import os
+          import pathlib
+
+          ref = os.environ["REF_NAME"]
+          if not ref.startswith("v"):
+              raise SystemExit(
+                  f"::error::TAG CHECK FAILED: ref {ref!r} is not a v-prefixed release tag"
+              )
+          tag_version = ref[1:]
+
+          init_path = pathlib.Path("src/cadmcp/__init__.py")
+          source = init_path.read_text(encoding="utf-8")
+          found = None
+          for node in ast.parse(source).body:
+              if isinstance(node, ast.Assign) and any(
+                  isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets
+              ):
+                  found = ast.literal_eval(node.value)
+          if found is None:
+              raise SystemExit(
+                  f"::error::TAG CHECK FAILED: no plain-literal __version__ assignment in {init_path}"
+              )
+          if found != tag_version:
+              raise SystemExit(
+                  f"::error::TAG CHECK FAILED: tag {ref} implies version {tag_version!r} "
+                  f"but cadmcp.__version__ is {found!r} — bump the source or retag"
+              )
+          print(f"::notice::TAG CHECK OK: {ref} == cadmcp.__version__ {found}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"version={found}\n")
+              fh.write(f"tag={ref}\n")
+          PY
+
+      - name: Build the wheel (PRIMARY channel, R-1)
+        working-directory: src
+        run: |
+          python -m build --wheel --outdir "$GITHUB_WORKSPACE/artifacts"
+          ls -la "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Freeze the one-dir bundle (FALLBACK channel, R-1)
+        working-directory: src
+        run: |
+          python -m PyInstaller --noconfirm entercad.spec
+          test -f dist/entercad/entercad.exe || { echo "::error::FREEZE FAILED: dist/entercad/entercad.exe not produced"; exit 1; }
+
+      # UNCONDITIONAL by design (R-8). There is no `if:` and no unsigned
+      # fallback branch: a missing AZURE_* secret must FAIL the job, never let
+      # an unsigned tree be published quietly.
+      - name: Sign the frozen tree (Azure Trusted Signing)
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: enterjobs-signing
+          certificate-profile-name: ${{ vars.AZURE_CERT_PROFILE }}
+          files-folder: src/dist/entercad
+          files-folder-filter: exe,dll,pyd
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Zip the signed frozen tree
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p artifacts
+          ZIP="artifacts/entercad-${VERSION}-win64.zip"
+          rm -f "$ZIP"
+          powershell -NoProfile -NonInteractive -Command "Compress-Archive -Path 'src/dist/entercad' -DestinationPath '$ZIP' -Force"
+          test -f "$ZIP" || { echo "::error::ZIP FAILED: $ZIP not produced"; exit 1; }
+          echo "zipped: $ZIP"
+
+      # Tool surface for the manifest table (R-3). Enumerated from the BUILT
+      # wheel installed into a throwaway venv, over stdio, with initialize +
+      # notifications/initialized + tools/list ONLY — never a tools/call, so no
+      # CAD/COM contact of any kind. Falls back to the read-only
+      # baseline/tools-baseline.json names; FAILS if both routes fail (an empty
+      # or guessed tools table would poison D3a's unknown-tool answers).
+      - name: Enumerate the tool surface (stdio; CAD-free) with a baseline fallback
+        run: |
+          set -u
+          python -m venv "$RUNNER_TEMP/probe"
+          PROBE_PY="$RUNNER_TEMP/probe/Scripts/python.exe"
+          "$PROBE_PY" -m pip install --disable-pip-version-check --upgrade pip
+          "$PROBE_PY" -m pip install "$(ls artifacts/*.whl | head -1)"
+          python - "$PROBE_PY" src/baseline/tools-baseline.json artifacts/tools.json <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import tempfile
+
+          probe_py, baseline_path, out_path = sys.argv[1:4]
+
+
+          def stdio_names():
+              """initialize + notifications/initialized + tools/list. Nothing else."""
+              env = {k: v for k, v in os.environ.items() if not k.startswith("CADMCP_")}
+              env.pop("PYTHONPATH", None)
+              env["PYTHONUTF8"] = "1"
+              proc = subprocess.Popen(
+                  [probe_py, "-m", "cadmcp"],
+                  cwd=tempfile.mkdtemp(),
+                  stdin=subprocess.PIPE,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  env=env,
+              )
+
+              def write(msg):
+                  proc.stdin.write((json.dumps(msg) + "\n").encode())
+                  proc.stdin.flush()
+
+              def read():
+                  line = proc.stdout.readline()
+                  if not line:
+                      tail = proc.stderr.read().decode(errors="replace")[-2000:]
+                      raise RuntimeError("server closed: " + tail)
+                  return json.loads(line)
+
+              try:
+                  write({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                      "protocolVersion": "2025-06-18",
+                      "capabilities": {},
+                      "clientInfo": {"name": "release-enumeration", "version": "0"},
+                  }})
+                  read()
+                  write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                  write({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                  result = read()["result"]
+              finally:
+                  try:
+                      proc.stdin.close()
+                  except Exception:
+                      pass
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=15)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+              return [t["name"] for t in result["tools"]]
+
+
+          names = None
+          first_error = None
+          try:
+              names = stdio_names()
+              print(f"::notice::tool surface enumerated over stdio from the built wheel ({len(names)} tools)")
+          except Exception as exc:
+              first_error = exc
+              print(f"::warning::stdio enumeration failed ({exc!r}) — falling back to baseline/tools-baseline.json")
+              try:
+                  data = json.loads(pathlib.Path(baseline_path).read_text(encoding="utf-8"))
+                  names = [t["name"] for t in data["tools"]]
+                  print(f"::notice::tools table taken from the baseline fallback ({len(names)} tools)")
+              except Exception as exc2:
+                  raise SystemExit(
+                      "::error::TOOL ENUMERATION FAILED: the stdio enumeration of the built wheel "
+                      f"({first_error!r}) AND the baseline fallback ({exc2!r}) both failed"
+                  )
+          if not names:
+              raise SystemExit("::error::TOOL ENUMERATION FAILED: empty tool list")
+          pathlib.Path(out_path).write_text(json.dumps(names, indent=1) + "\n", encoding="utf-8")
+          PY
+
+      # Carry-forward input for the tools table (R-3): the previous release's
+      # manifest, if this repo has one. `gh release download` with no tag takes
+      # the latest Release; the very first release has none and that is fine.
+      - name: Download the previous manifest (tolerant of no prior Release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p previous
+          rm -f previous/manifest.json
+          if gh release download --pattern manifest.json --dir previous --clobber; then
+            echo "::notice::previous manifest downloaded from the latest existing Release"
+          else
+            echo "::notice::no prior Release carrying a manifest.json — this build starts the tools table"
+            rm -f previous/manifest.json
+          fi
+
+      - name: Build manifest.json
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PYTHONPATH: src
+        run: |
+          set -u
+          WHEEL="$(ls artifacts/*.whl | head -1)"
+          PREV=""
+          if [ -f previous/manifest.json ]; then PREV="--previous previous/manifest.json"; fi
+          python release/scripts/build_manifest.py \
+            --wheel "$WHEEL" \
+            --zip "artifacts/entercad-${VERSION}-win64.zip" \
+            --version "$VERSION" \
+            --tools-json artifacts/tools.json \
+            $PREV \
+            --out artifacts/manifest.json
+          cat artifacts/manifest.json
+
+      - name: Upload the build as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: entercad-${{ steps.version.outputs.version }}
+          if-no-files-found: error
+          path: |
+            artifacts/*.whl
+            artifacts/*.zip
+            artifacts/manifest.json
+
+      - name: Publish the GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -u
+          WHEEL="$(ls artifacts/*.whl | head -1)"
+          ZIP="artifacts/entercad-${VERSION}-win64.zip"
+          {
+            echo "# EnterCad ${TAG}"
+            echo
+            tail -n +2 src/README-INSTALL.md
+            echo
+            echo "## Assets in this release"
+            echo
+            echo "- \`$(basename "$WHEEL")\` — the pip wheel (PRIMARY channel)."
+            echo "- \`$(basename "$ZIP")\` — the signed frozen one-dir bundle (FALLBACK channel; needs no Python)."
+            echo "- \`manifest.json\` — the update manifest the installed server reads."
+          } > release-notes.md
+          gh release create "$TAG" "$WHEEL" "$ZIP" artifacts/manifest.json --title "EnterCad ${TAG}" --notes-file release-notes.md
+
+      # R-1's third leg. Gated on the token being PRESENT: with no
+      # secrets.PYPI_API_TOKEN this step skips and records the reason as a
+      # ::notice — a recorded skip is a PASS, not a failure.
+      - name: Publish to PyPI
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          TWINE_USERNAME: __token__
+        run: |
+          if [ -z "${PYPI_API_TOKEN:-}" ]; then
+            echo "::notice::PyPI publish SKIPPED — reason: secret PYPI_API_TOKEN is not set on this repository. R-1 records this skip as a PASS; the GitHub Release channel already shipped."
+            exit 0
+          fi
+          python -m pip install --upgrade twine
+          TWINE_PASSWORD="$PYPI_API_TOKEN" python -m twine upload --non-interactive artifacts/*.whl
