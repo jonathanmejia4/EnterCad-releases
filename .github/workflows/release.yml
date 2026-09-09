@@ -69,22 +69,35 @@ jobs:
       # `__version__` assignment in src/cadmcp/__init__.py; the package is NEVER
       # imported here (an import would drag in config/driver resolution just to
       # read a plain string literal).
+      #
+      # Two paths:
+      #   - push (a `v*` tag): the tag IS the release; ref_name minus `v` must
+      #     equal cadmcp.__version__ exactly, or the job fails closed — unchanged.
+      #   - workflow_dispatch: the BUILD-ONLY path (GATE-FREEZE-BOOT's vehicle).
+      #     There is no release tag yet — ref_name is a branch (e.g. "main") —
+      #     so the version IS __version__ from source and the tag is DERIVED as
+      #     "v<version>", never read from ref_name. A dispatch with
+      #     inputs.publish true additionally fails closed if a tag named
+      #     v<version> already exists on this (releases) repo, so a publish can
+      #     never silently overwrite a version that already shipped.
       - name: Tag check (tag minus v must equal cadmcp.__version__)
         id: version
         env:
+          EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
+          PUBLISH: ${{ inputs.publish }}
         run: |
+          EXISTING_TAGS="$(git ls-remote --tags origin 2>/dev/null | sed -n 's#.*refs/tags/##p')"
+          export EXISTING_TAGS
           python - <<'PY'
           import ast
           import os
           import pathlib
 
+          event_name = os.environ["EVENT_NAME"]
           ref = os.environ["REF_NAME"]
-          if not ref.startswith("v"):
-              raise SystemExit(
-                  f"::error::TAG CHECK FAILED: ref {ref!r} is not a v-prefixed release tag"
-              )
-          tag_version = ref[1:]
+          publish = os.environ.get("PUBLISH", "false").lower() == "true"
+          existing_tags = set(os.environ.get("EXISTING_TAGS", "").split())
 
           init_path = pathlib.Path("src/cadmcp/__init__.py")
           source = init_path.read_text(encoding="utf-8")
@@ -98,15 +111,33 @@ jobs:
               raise SystemExit(
                   f"::error::TAG CHECK FAILED: no plain-literal __version__ assignment in {init_path}"
               )
-          if found != tag_version:
-              raise SystemExit(
-                  f"::error::TAG CHECK FAILED: tag {ref} implies version {tag_version!r} "
-                  f"but cadmcp.__version__ is {found!r} — bump the source or retag"
-              )
-          print(f"::notice::TAG CHECK OK: {ref} == cadmcp.__version__ {found}")
+
+          if event_name == "push":
+              if not ref.startswith("v"):
+                  raise SystemExit(
+                      f"::error::TAG CHECK FAILED: ref {ref!r} is not a v-prefixed release tag"
+                  )
+              tag_version = ref[1:]
+              if found != tag_version:
+                  raise SystemExit(
+                      f"::error::TAG CHECK FAILED: tag {ref} implies version {tag_version!r} "
+                      f"but cadmcp.__version__ is {found!r} — bump the source or retag"
+                  )
+              version, tag = found, ref
+          else:
+              # workflow_dispatch: build-only path — ref_name is a branch, not a
+              # tag. The version IS __version__ from source; the tag is derived.
+              version, tag = found, f"v{found}"
+              if publish and tag in existing_tags:
+                  raise SystemExit(
+                      f"::error::TAG CHECK FAILED: {tag} already exists on the releases repo — "
+                      "a publish dispatch must never overwrite a published version"
+                  )
+
+          print(f"::notice::TAG CHECK OK: {tag} == cadmcp.__version__ {version}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"version={found}\n")
-              fh.write(f"tag={ref}\n")
+              fh.write(f"version={version}\n")
+              fh.write(f"tag={tag}\n")
           PY
 
       - name: Build the wheel (PRIMARY channel, R-1)
@@ -310,7 +341,7 @@ jobs:
             echo "- \`$(basename "$ZIP")\` — the signed frozen one-dir bundle (FALLBACK channel; needs no Python)."
             echo "- \`manifest.json\` — the update manifest the installed server reads."
           } > release-notes.md
-          gh release create "$TAG" "$WHEEL" "$ZIP" artifacts/manifest.json --title "EnterCad ${TAG}" --notes-file release-notes.md
+          gh release create "$TAG" "$WHEEL" "$ZIP" artifacts/manifest.json --target "$(git rev-parse HEAD)" --title "EnterCad ${TAG}" --notes-file release-notes.md
 
       # R-1's third leg. Gated on the token being PRESENT: with no
       # secrets.PYPI_API_TOKEN this step skips and records the reason as a
