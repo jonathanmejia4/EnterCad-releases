@@ -54,6 +54,7 @@ jobs:
             pyproject.toml
             README-INSTALL.md
             baseline/tools-baseline.json
+            baseline/tools-additions.json
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -170,6 +171,26 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      # GATE-FREEZE-BOOT, self-proven by every release (R-9, R-10). Runs on the
+      # signed tree, before it is zipped, so the artifact that ships is the
+      # EXACT tree this step just booted: no Python on PATH, no PYTHON*/
+      # CADMCP_* inherited env, cwd outside src/. UNCONDITIONAL by design —
+      # no `if:`, no --skip-signature — a violation (drift, a slow boot, an
+      # unsigned exe, a crash instead of a clean refusal) fails the job.
+      - name: Boot proof (frozen exe, no Python on PATH)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -u
+          python release/scripts/boot_proof.py \
+            --exe src/dist/entercad/entercad.exe \
+            --baseline src/baseline/tools-baseline.json \
+            --additions src/baseline/tools-additions.json \
+            --samples 9 \
+            --expect-version "$VERSION" \
+            --out artifacts/boot-proof.json
+          cat artifacts/boot-proof.json
 
       - name: Zip the signed frozen tree
         env:
@@ -319,6 +340,7 @@ jobs:
             artifacts/*.whl
             artifacts/*.zip
             artifacts/manifest.json
+            artifacts/boot-proof.json
 
       - name: Publish the GitHub Release
         if: ${{ github.event_name == 'push' || inputs.publish }}
