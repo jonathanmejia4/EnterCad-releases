@@ -61,10 +61,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      # F9: the BUILD tools are pinned to exact versions, equal to the author's
+      # validated toolchain (baseline/toolchain.json "versions" in the source
+      # repo), so the published tree cannot change with no code change.
+      # pyinstaller-hooks-contrib is pinned too: it is a floating dependency of
+      # pyinstaller whose hooks decide what a freeze collects (a newer
+      # hook-tzdata once turned one local freeze into 605 files). 2026.7 is
+      # the version the R-4 freeze test was validated against, and the one
+      # v0.1.0's run resolved. The product's own runtime ranges (mcp, psutil,
+      # tomli-w) stay ranges.
       - name: Install the build toolchain
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build setuptools wheel pyinstaller "mcp>=2.1,<3" "pywin32>=306" psutil tomli-w
+          python -m pip install build==1.6.0 setuptools==84.0.0 wheel==0.48.0 pyinstaller==6.22.2 pyinstaller-hooks-contrib==2026.7 "mcp>=2.1,<3" pywin32==312 psutil tomli-w
 
       # TAG CHECK — fail closed. The version is read with ast.literal_eval of the
       # `__version__` assignment in src/cadmcp/__init__.py; the package is NEVER
@@ -147,15 +156,49 @@ jobs:
           python -m build --wheel --outdir "$GITHUB_WORKSPACE/artifacts"
           ls -la "$GITHUB_WORKSPACE/artifacts"
 
+      # F11a: HERMETIC PATH. PyInstaller resolves a binary's DLL dependencies
+      # the way the Windows loader would, PATH included, and bundles every one
+      # it finds OUTSIDE a system directory. Under the runner's own PATH the
+      # artifact's contents were a function of whatever the runner image has
+      # installed: v0.1.0 shipped 43 api-ms-win-*.dll + ucrtbase.dll out of the
+      # image's Java JDK bin/ and mfc140u.dll out of its ImageMagick folder.
+      # So PyInstaller runs with a PATH of the OS directories plus this
+      # interpreter's own directories and NOTHING else (the recipe of
+      # tests/test_freeze_tree.py::_hermetic_path in the source repo). Each
+      # half is asked of its owner: the OS for %SystemRoot%, the interpreter
+      # setup-python installed for sys.base_prefix and sys.executable.
       - name: Freeze the one-dir bundle (FALLBACK channel, R-1)
         working-directory: src
         run: |
-          python -m PyInstaller --noconfirm entercad.spec
+          set -u
+          SYSROOT="$(cygpath -u "${SYSTEMROOT:?SystemRoot is not set}")"
+          PY_PREFIX="$(cygpath -u "$(python -c 'import sys; sys.stdout.write(sys.base_prefix)')")"
+          PY_EXEDIR="$(cygpath -u "$(python -c 'import os, sys; sys.stdout.write(os.path.dirname(sys.executable))')")"
+          HERMETIC_PATH="$SYSROOT/System32:$SYSROOT:$SYSROOT/System32/Wbem:$SYSROOT/System32/WindowsPowerShell/v1.0:$PY_PREFIX:$PY_PREFIX/Scripts:$PY_EXEDIR"
+          echo "hermetic build PATH: $HERMETIC_PATH"
+          PATH="$HERMETIC_PATH" python -m PyInstaller --noconfirm entercad.spec
           test -f dist/entercad/entercad.exe || { echo "::error::FREEZE FAILED: dist/entercad/entercad.exe not produced"; exit 1; }
+
+      # F11b: sign ONLY the PE files (.exe/.dll/.pyd) that do not already carry
+      # a valid embedded Authenticode signature. v0.1.0 swept the whole folder
+      # and so replaced third-party signatures (Microsoft's on the C runtime,
+      # the PSF's on python312.dll) with ours. The plan step asks Windows for every PE's signature and writes
+      # the ones without a valid one (entercad.exe always among them) as the
+      # signing action's files-catalog, outside the tree that ships; every
+      # validly-signed third-party file is left untouched.
+      - name: Plan the signing set (PE files without a valid signature)
+        run: |
+          set -u
+          python release/scripts/unsigned_pe_list.py plan \
+            --tree src/dist/entercad \
+            --catalog src/dist/sign-catalog.txt \
+            --out src/dist/signing-plan.json
 
       # UNCONDITIONAL by design (R-8). There is no `if:` and no unsigned
       # fallback branch: a missing AZURE_* secret must FAIL the job, never let
-      # an unsigned tree be published quietly.
+      # an unsigned tree be published quietly. `files-catalog` (an input of
+      # the pinned action's v0 line, v0.5.11) names the computed list above;
+      # there is deliberately no files-folder sweep.
       - name: Sign the frozen tree (Azure Trusted Signing)
         uses: azure/trusted-signing-action@v0
         with:
@@ -165,12 +208,24 @@ jobs:
           endpoint: https://eus.codesigning.azure.net/
           trusted-signing-account-name: enterjobs-signing
           certificate-profile-name: ${{ vars.AZURE_CERT_PROFILE }}
-          files-folder: src/dist/entercad
-          files-folder-filter: exe,dll,pyd
-          files-folder-recurse: true
+          files-catalog: src/dist/sign-catalog.txt
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      # The Smart App Control invariant, proven on the tree that ships: every
+      # PE is Valid with an embedded signature, every file that was already
+      # validly signed still carries its ORIGINAL signer, and every file in
+      # the signing set is now signed by the release identity. UNCONDITIONAL,
+      # like the signing step it checks.
+      - name: Verify every PE signature (ours, or its original publisher's)
+        run: |
+          set -u
+          python release/scripts/unsigned_pe_list.py verify \
+            --tree src/dist/entercad \
+            --plan src/dist/signing-plan.json \
+            --expect-cn "Jonathan Mejia" \
+            --out artifacts/signing-report.json
 
       # GATE-FREEZE-BOOT, self-proven by every release (R-9, R-10). Runs on the
       # signed tree, before it is zipped, so the artifact that ships is the
@@ -341,6 +396,7 @@ jobs:
             artifacts/*.zip
             artifacts/manifest.json
             artifacts/boot-proof.json
+            artifacts/signing-report.json
 
       - name: Publish the GitHub Release
         if: ${{ github.event_name == 'push' || inputs.publish }}
