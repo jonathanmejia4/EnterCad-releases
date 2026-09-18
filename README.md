@@ -59,10 +59,16 @@ what changed. Reconnect the server in your agent afterwards.
 | `entercad-<version>-win64.zip` | The **fallback** channel: a signed PyInstaller one-dir bundle for 64-bit Windows. Unzip and run `entercad\entercad.exe` — no Python needed. |
 | `manifest.json` | The update manifest. It carries this release's version, the schema version and the publisher's supported-schema floor, the download URL and SHA-256 of both artifacts above, and the table of tool names with the version each was introduced in (removed names stay in the table, tombstoned). The installed server reads it to answer "am I current?" and "what happened to this tool?". |
 
-Every `.exe`, `.dll` and `.pyd` in the frozen bundle is signed with Azure
-Trusted Signing (publisher CN "Jonathan Mejia", RFC-3161 timestamped). The
-signing step is unconditional: a release that could not be signed is never
-published.
+Every `.exe`, `.dll` and `.pyd` in the frozen bundle carries a valid
+Authenticode signature. The files we build, and any that arrive without a
+valid embedded signature, are signed with Azure Trusted Signing (publisher CN
+"Jonathan Mejia", RFC-3161 timestamped). Third-party files that already carry
+a valid embedded signature (the Python Software Foundation's CPython files,
+Microsoft's VC runtime) keep their original publisher's signature. The signing
+report, `signing-report.json`, names every one of those files and which
+signature it carries; it ships with each release run's workflow build
+artifacts. The signing step is unconditional: a release that could not be
+signed is never published.
 
 ## Verifying a download
 
