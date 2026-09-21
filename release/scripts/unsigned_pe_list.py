@@ -81,7 +81,6 @@ import json
 import os
 import re
 import sys
-from ctypes import wintypes
 from pathlib import Path
 
 # The extensions the replaced files-folder sweep signed. Enumeration is by MZ
@@ -121,40 +120,56 @@ class SignPlanError(Exception):
     """A named reason this tree cannot be planned or verified."""
 
 
+# The Win32 type aliases this file needs, spelled out rather than imported
+# from ctypes.wintypes: that module is not importable on every platform (its
+# VARIANT_BOOL is unconditional), and this file must IMPORT anywhere -- the
+# test suite reads it on Linux too. It fails closed at the first Windows call
+# instead, in _windows_libraries().
+_DWORD = ctypes.c_ulong
+_WORD = ctypes.c_ushort
+_HANDLE = ctypes.c_void_p
+_LPCWSTR = ctypes.c_wchar_p
+_LPWSTR = ctypes.c_wchar_p
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", _DWORD), ("dwHighDateTime", _DWORD)]
+
+
 # ---------------------------------------------------------------------------
 # Authenticode, read through ctypes (no shell, no cmdlet, no module to load)
 # ---------------------------------------------------------------------------
 
 class _GUID(ctypes.Structure):
-    _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
-                ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+    _fields_ = [("Data1", _DWORD), ("Data2", _WORD),
+                ("Data3", _WORD), ("Data4", ctypes.c_ubyte * 8)]
 
 
 class _WINTRUST_FILE_INFO(ctypes.Structure):
-    _fields_ = [("cbStruct", wintypes.DWORD),
-                ("pcwszFilePath", wintypes.LPCWSTR),
-                ("hFile", wintypes.HANDLE),
+    _fields_ = [("cbStruct", _DWORD),
+                ("pcwszFilePath", _LPCWSTR),
+                ("hFile", _HANDLE),
                 ("pgKnownSubject", ctypes.c_void_p)]
 
 
 class _WINTRUST_DATA(ctypes.Structure):
-    _fields_ = [("cbStruct", wintypes.DWORD),
+    _fields_ = [("cbStruct", _DWORD),
                 ("pPolicyCallbackData", ctypes.c_void_p),
                 ("pSIPClientData", ctypes.c_void_p),
-                ("dwUIChoice", wintypes.DWORD),
-                ("fdwRevocationChecks", wintypes.DWORD),
-                ("dwUnionChoice", wintypes.DWORD),
+                ("dwUIChoice", _DWORD),
+                ("fdwRevocationChecks", _DWORD),
+                ("dwUnionChoice", _DWORD),
                 ("pFile", ctypes.POINTER(_WINTRUST_FILE_INFO)),
-                ("dwStateAction", wintypes.DWORD),
-                ("hWVTStateData", wintypes.HANDLE),
-                ("pwszURLReference", wintypes.LPWSTR),
-                ("dwProvFlags", wintypes.DWORD),
-                ("dwUIContext", wintypes.DWORD),
+                ("dwStateAction", _DWORD),
+                ("hWVTStateData", _HANDLE),
+                ("pwszURLReference", _LPWSTR),
+                ("dwProvFlags", _DWORD),
+                ("dwUIContext", _DWORD),
                 ("pSignatureSettings", ctypes.c_void_p)]
 
 
 class _CRYPT_BLOB(ctypes.Structure):
-    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+    _fields_ = [("cbData", _DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
 
 class _CRYPT_ALGORITHM_IDENTIFIER(ctypes.Structure):
@@ -162,8 +177,8 @@ class _CRYPT_ALGORITHM_IDENTIFIER(ctypes.Structure):
 
 
 class _CRYPT_BIT_BLOB(ctypes.Structure):
-    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
-                ("cUnusedBits", wintypes.DWORD)]
+    _fields_ = [("cbData", _DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+                ("cUnusedBits", _DWORD)]
 
 
 class _CERT_PUBLIC_KEY_INFO(ctypes.Structure):
@@ -171,11 +186,11 @@ class _CERT_PUBLIC_KEY_INFO(ctypes.Structure):
 
 
 class _CRYPT_ATTRIBUTES(ctypes.Structure):
-    _fields_ = [("cAttr", wintypes.DWORD), ("rgAttr", ctypes.c_void_p)]
+    _fields_ = [("cAttr", _DWORD), ("rgAttr", ctypes.c_void_p)]
 
 
 class _CMSG_SIGNER_INFO(ctypes.Structure):
-    _fields_ = [("dwVersion", wintypes.DWORD),
+    _fields_ = [("dwVersion", _DWORD),
                 ("Issuer", _CRYPT_BLOB),
                 ("SerialNumber", _CRYPT_BLOB),
                 ("HashAlgorithm", _CRYPT_ALGORITHM_IDENTIFIER),
@@ -186,24 +201,24 @@ class _CMSG_SIGNER_INFO(ctypes.Structure):
 
 
 class _CERT_INFO(ctypes.Structure):
-    _fields_ = [("dwVersion", wintypes.DWORD),
+    _fields_ = [("dwVersion", _DWORD),
                 ("SerialNumber", _CRYPT_BLOB),
                 ("SignatureAlgorithm", _CRYPT_ALGORITHM_IDENTIFIER),
                 ("Issuer", _CRYPT_BLOB),
-                ("NotBefore", wintypes.FILETIME),
-                ("NotAfter", wintypes.FILETIME),
+                ("NotBefore", _FILETIME),
+                ("NotAfter", _FILETIME),
                 ("Subject", _CRYPT_BLOB),
                 ("SubjectPublicKeyInfo", _CERT_PUBLIC_KEY_INFO),
                 ("IssuerUniqueId", _CRYPT_BIT_BLOB),
                 ("SubjectUniqueId", _CRYPT_BIT_BLOB),
-                ("cExtension", wintypes.DWORD),
+                ("cExtension", _DWORD),
                 ("rgExtension", ctypes.c_void_p)]
 
 
 class _CERT_CONTEXT(ctypes.Structure):
-    _fields_ = [("dwCertEncodingType", wintypes.DWORD),
+    _fields_ = [("dwCertEncodingType", _DWORD),
                 ("pbCertEncoded", ctypes.POINTER(ctypes.c_ubyte)),
-                ("cbCertEncoded", wintypes.DWORD),
+                ("cbCertEncoded", _DWORD),
                 ("pCertInfo", ctypes.POINTER(_CERT_INFO)),
                 ("hCertStore", ctypes.c_void_p)]
 
@@ -241,7 +256,7 @@ def _windows_libraries():
             crypt32 = ctypes.WinDLL("crypt32.dll")
         except OSError as exc:  # pragma: no cover - a Windows without wintrust/crypt32
             raise SignPlanError(f"cannot load wintrust.dll/crypt32.dll: {exc}") from exc
-        wintrust.WinVerifyTrust.argtypes = [wintypes.HANDLE, ctypes.POINTER(_GUID),
+        wintrust.WinVerifyTrust.argtypes = [_HANDLE, ctypes.POINTER(_GUID),
                                             ctypes.POINTER(_WINTRUST_DATA)]
         wintrust.WinVerifyTrust.restype = ctypes.c_long
         crypt32.CertFindCertificateInStore.restype = ctypes.POINTER(_CERT_CONTEXT)
@@ -281,9 +296,9 @@ def embedded_signer(path):
     """-> (subject, thumbprint) of the file's embedded signature's signer
     certificate, or ("", "") when it carries none."""
     _, crypt32 = _windows_libraries()
-    encoding = wintypes.DWORD()
-    content_type = wintypes.DWORD()
-    format_type = wintypes.DWORD()
+    encoding = _DWORD()
+    content_type = _DWORD()
+    format_type = _DWORD()
     store = ctypes.c_void_p()
     msg = ctypes.c_void_p()
     ok = crypt32.CryptQueryObject(
@@ -296,7 +311,7 @@ def embedded_signer(path):
         return "", ""
 
     try:
-        size = wintypes.DWORD()
+        size = _DWORD()
         if not crypt32.CryptMsgGetParam(msg, _CMSG_SIGNER_INFO_PARAM, 0, None,
                                         ctypes.byref(size)):
             return "", ""
@@ -325,7 +340,7 @@ def embedded_signer(path):
                                    name_format, text, length)
             subject = text.value
 
-            hash_size = wintypes.DWORD(20)
+            hash_size = _DWORD(20)
             digest = ctypes.create_string_buffer(20)
             thumbprint = ""
             if crypt32.CertGetCertificateContextProperty(
