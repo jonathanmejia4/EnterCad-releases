@@ -39,7 +39,9 @@ jobs:
       # reference/, scripts/, runs/ and cadmcp/acceptance/ never reach the
       # runner, so they can never reach an artifact. baseline/tools-baseline.json
       # is read-only input for the manifest tools table when the live stdio
-      # enumeration cannot run; nothing under baseline/ is ever published.
+      # enumeration cannot run; baseline/tools-tombstones.json (C6) is read-only
+      # input for the manifest's --removed args; nothing under baseline/ is
+      # ever published.
       - name: Sparse-checkout the private source
         uses: actions/checkout@v4
         with:
@@ -55,6 +57,7 @@ jobs:
             README-INSTALL.md
             baseline/tools-baseline.json
             baseline/tools-additions.json
+            baseline/tools-tombstones.json
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -368,10 +371,69 @@ jobs:
             rm -f previous/manifest.json
           fi
 
+      # C6: turn baseline/tools-tombstones.json (the machine-readable
+      # projection of baseline/tools-additions.json's "tombstones" array,
+      # sparse-checked-out above) into repeatable `--removed NAME` args for
+      # the manifest build below -- one per tombstone whose version_removed
+      # equals THIS release's version. Fails closed (a non-zero exit, no
+      # `removed_args` output written) on anything short of a well-formed
+      # {"tombstones": [{"name": ..., "version_removed": ...}, ...]} object,
+      # so a corrupt ledger can never silently build a manifest that forgot a
+      # removal.
+      - name: Compute --removed args from the tombstone ledger
+        id: tombstones
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -u
+          python - "$VERSION" src/baseline/tools-tombstones.json <<'PY'
+          import json
+          import os
+          import sys
+
+          version, path = sys.argv[1], sys.argv[2]
+
+          try:
+              with open(path, "r", encoding="utf-8") as fh:
+                  text = fh.read()
+          except OSError as exc:
+              raise SystemExit(f"::error::TOMBSTONE LEDGER FAILED: cannot read {path}: {exc}")
+
+          try:
+              data = json.loads(text)
+          except json.JSONDecodeError as exc:
+              raise SystemExit(f"::error::TOMBSTONE LEDGER FAILED: {path} is not valid JSON: {exc}")
+
+          tombstones = data.get("tombstones") if isinstance(data, dict) else None
+          if not isinstance(tombstones, list):
+              raise SystemExit(
+                  f"::error::TOMBSTONE LEDGER FAILED: {path} must be a JSON object with a "
+                  "'tombstones' list"
+              )
+
+          names = []
+          for entry in tombstones:
+              if (not isinstance(entry, dict)
+                      or not isinstance(entry.get("name"), str)
+                      or not entry.get("name")
+                      or not isinstance(entry.get("version_removed"), str)):
+                  raise SystemExit(
+                      f"::error::TOMBSTONE LEDGER FAILED: {path} has a malformed entry: {entry!r}"
+                  )
+              if entry["version_removed"] == version:
+                  names.append(entry["name"])
+
+          args = " ".join(f"--removed {name}" for name in names)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"removed_args={args}\n")
+          print(f"::notice::tombstones for {version}: {names}")
+          PY
+
       - name: Build manifest.json
         env:
           VERSION: ${{ steps.version.outputs.version }}
           PYTHONPATH: src
+          REMOVED_ARGS: ${{ steps.tombstones.outputs.removed_args }}
         run: |
           set -u
           WHEEL="$(ls artifacts/*.whl | head -1)"
@@ -383,6 +445,7 @@ jobs:
             --version "$VERSION" \
             --tools-json artifacts/tools.json \
             $PREV \
+            $REMOVED_ARGS \
             --out artifacts/manifest.json
           cat artifacts/manifest.json
 
